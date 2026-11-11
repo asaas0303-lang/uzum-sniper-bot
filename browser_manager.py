@@ -40,16 +40,48 @@ class UzumBrowserManager:
             await self.playwright.stop()
             self.playwright = None
 
-    @staticmethod
-    def _parse_uzum_payload(data: dict, fallback_id: str = "") -> dict | None:
-        payload = data.get("payload", {})
-        product_obj = payload.get("data", data.get("data", data))
+    @classmethod
+    def _find_product_dict(cls, obj):
+        candidates = []
+
+        def _walk(o):
+            if isinstance(o, dict):
+                if "skuList" in o and isinstance(o["skuList"], list) and len(o["skuList"]) > 0:
+                    candidates.append(o)
+                for v in o.values():
+                    _walk(v)
+            elif isinstance(o, list):
+                for item in o:
+                    _walk(item)
+
+        _walk(obj)
+        if not candidates:
+            return None
+        # Avval narxlari (sellPrice / purchasePrice / fullPrice / priceBlock) mavjud bo'lganini tanlaymiz
+        for c in candidates:
+            first_sku = c["skuList"][0]
+            if isinstance(first_sku, dict) and any(
+                k in first_sku for k in ["purchasePrice", "sellPrice", "fullPrice", "priceBlock"]
+            ):
+                return c
+        return candidates[0]
+
+    @classmethod
+    def _parse_uzum_payload(cls, data: dict, fallback_id: str = "") -> dict | None:
+        if not isinstance(data, dict):
+            return None
+        product_obj = cls._find_product_dict(data)
         if not isinstance(product_obj, dict):
             return None
 
         title = product_obj.get("title")
+        if not title:
+            loc = product_obj.get("localizableTitle")
+            if isinstance(loc, dict):
+                title = loc.get("titleUz") or loc.get("titleRu")
+
         sku_list = product_obj.get("skuList")
-        if not title or not isinstance(sku_list, list) or not sku_list:
+        if not isinstance(sku_list, list) or not sku_list:
             return None
 
         photo_url = None
@@ -72,14 +104,44 @@ class UzumBrowserManager:
                                 if isinstance(v, dict) and (v.get("high") or v.get("low")):
                                     photo_url = v.get("high") or v.get("low")
                                     break
+            elif isinstance(first_p, str) and first_p.startswith("http"):
+                photo_url = first_p
+
+        # Agar bosh rasm topilmasa, SKU ichidagi rasmni olish
+        if not photo_url:
+            for s in sku_list:
+                if isinstance(s, dict) and isinstance(s.get("photo"), dict):
+                    p_link = s["photo"].get("link")
+                    if isinstance(p_link, dict):
+                        photo_url = p_link.get("high") or p_link.get("low")
+                        if photo_url:
+                            break
+                    elif s["photo"].get("key"):
+                        photo_url = f"https://images.uzum.uz/{s['photo']['key']}/original.jpg"
+                        break
+
+        if photo_url and "_low.jpg" in photo_url:
+            photo_url = photo_url.replace("_low.jpg", "_high.jpg").replace("240", "540")
 
         char_groups = product_obj.get("characteristics", [])
         variants = []
 
         for idx, s in enumerate(sku_list):
+            if not isinstance(s, dict):
+                continue
             s_id = str(s.get("id", ""))
-            p_price = int(s.get("purchasePrice") or s.get("fullPrice") or 0)
-            f_price = int(s.get("fullPrice") or p_price)
+            p_price = int(
+                s.get("purchasePrice")
+                or s.get("sellPrice")
+                or (s.get("priceBlock", {}).get("sellPrice", {}).get("amount") if isinstance(s.get("priceBlock"), dict) else 0)
+                or s.get("fullPrice")
+                or 0
+            )
+            f_price = int(
+                s.get("fullPrice")
+                or (s.get("priceBlock", {}).get("fullPrice", {}).get("amount") if isinstance(s.get("priceBlock"), dict) else 0)
+                or p_price
+            )
             avail = int(s.get("availableAmount") or 0)
 
             char_parts = []
@@ -102,7 +164,8 @@ class UzumBrowserManager:
                     elif sc.get("valueTitle") or sc.get("title"):
                         char_parts.append(str(sc.get("valueTitle") or sc.get("title")))
 
-            char_desc = " / ".join(char_parts) if char_parts else (f"Variant #{idx + 1}" if len(sku_list) > 1 else "Standart")
+            sku_title = s.get("skuTitle") or s.get("title")
+            char_desc = " / ".join(char_parts) if char_parts else (sku_title if sku_title else (f"Variant #{idx + 1}" if len(sku_list) > 1 else "Standart"))
 
             variants.append({
                 "sku_id": s_id,
@@ -112,9 +175,12 @@ class UzumBrowserManager:
                 "available": avail,
             })
 
+        if not variants:
+            return None
+
         return {
             "id": str(product_obj.get("id") or fallback_id),
-            "title": title,
+            "title": title or f"Uzum Mahsuloti #{fallback_id}",
             "photo_url": photo_url,
             "variants": variants,
         }
@@ -196,32 +262,38 @@ class UzumBrowserManager:
         return None
 
     async def fetch_product_with_playwright(self, product_url: str) -> dict | None:
+        base_path = product_url.split("?")[0].rstrip("/")
+        m = re.search(r"(\d+)$", base_path)
+        if not m:
+            m = re.search(r"product/.*?(\d+)", base_path)
+        p_id = m.group(1) if m else "0"
+
+        sku_match = re.search(r"skuId=(\d+)", product_url)
+        url_sku_id = sku_match.group(1) if sku_match else p_id
+
+        # 1. Avval tezkor API ni sinab ko'ramiz
         quick = await asyncio.to_thread(self.fetch_product_quick, product_url)
-        if quick and quick.get("variants") and quick["variants"][0].get("price", 0) > 0:
+        if quick and quick.get("variants") and quick["variants"][0].get("price", 0) > 0 and not quick["title"].startswith("Uzum Tovar #"):
             return quick
 
+        # 2. Playwright orqali sahifani ochish va ichki API + DOM dan o'qish
         async with self._lock:
             await self.start(headless=HEADLESS)
             page = await self.context.new_page()
             captured_parsed = None
 
-            base_path = product_url.split("?")[0].rstrip("/")
-            m = re.search(r"(\d+)$", base_path)
-            p_id = m.group(1) if m else "0"
-            sku_match = re.search(r"skuId=(\d+)", product_url)
-            url_sku_id = sku_match.group(1) if sku_match else p_id
-
             async def on_resp(response: Response):
                 nonlocal captured_parsed
                 if captured_parsed is not None:
                     return
-                if "application/json" not in response.headers.get("content-type", ""):
+                ctype = response.headers.get("content-type", "")
+                if "json" not in ctype:
                     return
-                if any(k in response.url for k in ["api.uzum.uz", "/product/", "v2/product"]):
+                if any(k in response.url for k in ["uzum.uz", "product", "graphql"]):
                     try:
                         raw = await response.json()
                         parsed = self._parse_uzum_payload(raw, p_id)
-                        if parsed and parsed.get("variants"):
+                        if parsed and parsed.get("variants") and parsed["variants"][0].get("price", 0) > 0:
                             captured_parsed = parsed
                     except Exception:
                         pass
@@ -229,52 +301,138 @@ class UzumBrowserManager:
             page.on("response", on_resp)
             try:
                 await page.goto(product_url, wait_until="domcontentloaded", timeout=45000)
-                for _ in range(16):
+
+                # A) Brauzer kontekstining o'zidan (cookie va tokenlar bilan) API ga fetch yuborish
+                try:
+                    in_page_json = await page.evaluate(
+                        '''async (pid) => {
+                            try {
+                                const r = await fetch(`https://api.uzum.uz/api/v2/product/${pid}`, {
+                                    headers: { "Accept": "application/json", "Accept-Language": "uz-UZ,uz;q=0.9,ru;q=0.8" },
+                                    credentials: "include"
+                                });
+                                if (r.ok) return await r.json();
+                            } catch (e) {}
+                            return null;
+                        }''',
+                        p_id
+                    )
+                    if in_page_json:
+                        parsed_in_page = self._parse_uzum_payload(in_page_json, p_id)
+                        if parsed_in_page and parsed_in_page.get("variants") and parsed_in_page["variants"][0].get("price", 0) > 0:
+                            captured_parsed = parsed_in_page
+                except Exception:
+                    pass
+
+                # B) Network interceptor javobini va h1 elementini kutish
+                try:
+                    await page.wait_for_selector("h1", timeout=12000)
+                except Exception:
+                    pass
+
+                for _ in range(20):
                     if captured_parsed is not None:
                         break
                     await asyncio.sleep(0.5)
 
                 if captured_parsed:
+                    # Agar sarlavha umumiy bo'lsa yoki rasm bo'lmasa, DOM dan boyitish
+                    if not captured_parsed.get("title") or captured_parsed["title"].startswith("Uzum Mahsuloti"):
+                        try:
+                            h1 = (await page.locator("h1").first.inner_text()).strip()
+                            if h1:
+                                captured_parsed["title"] = h1
+                        except Exception:
+                            pass
+                    if not captured_parsed.get("photo_url"):
+                        try:
+                            img = await page.locator("img[src*='images.uzum.uz']").first.get_attribute("src")
+                            if img:
+                                captured_parsed["photo_url"] = img
+                        except Exception:
+                            pass
                     return captured_parsed
 
-                dom_info = await self._fallback_dom_extract(page)
-                og_img = None
-                try:
-                    og_el = page.locator("meta[property='og:image']").first
-                    if await og_el.count() > 0:
-                        og_img = await og_el.get_attribute("content")
-                except Exception:
-                    pass
+                # C) Sahifa ichidagi SSR state (__NUXT__ / __INITIAL_STATE__ / ld+json) va DOM dan o'qish
+                dom_scraped = await page.evaluate(
+                    '''(args) => {
+                        const { pid, skuId } = args;
+                        for (const key of ["__INITIAL_STATE__", "__NUXT__", "__NEXT_DATA__"]) {
+                            if (window[key]) {
+                                return { ssr_state: window[key] };
+                            }
+                        }
+                        const h1 = document.querySelector("h1");
+                        const title = h1 ? h1.innerText.trim() : document.title;
 
-                price_val = dom_info["price"] if dom_info else 0
-                title_val = dom_info["title"] if dom_info else (quick["title"] if quick else f"Uzum Tovar #{p_id}")
+                        let photo = null;
+                        const ogImg = document.querySelector("meta[property='og:image']");
+                        if (ogImg && ogImg.content) photo = ogImg.content;
+                        if (!photo) {
+                            const imgEl = document.querySelector("img[src*='images.uzum.uz']");
+                            if (imgEl) photo = imgEl.src;
+                        }
 
-                return {
-                    "id": p_id,
-                    "title": title_val,
-                    "photo_url": og_img or (quick["photo_url"] if quick else None),
-                    "variants": [{
-                        "sku_id": url_sku_id,
-                        "name": f"SKU #{url_sku_id}" if url_sku_id != p_id else "Tanlangan variant",
-                        "price": price_val,
-                        "full_price": price_val,
-                        "available": dom_info["available_amount"] if dom_info else 1,
-                    }],
-                }
+                        let discountPrice = 0;
+                        let fullPrice = 0;
+                        const priceNodes = Array.from(document.querySelectorAll("[data-test-id*='price'], [class*='price'], span, div"));
+                        const foundPrices = [];
+                        for (const el of priceNodes) {
+                            if (el.children.length === 0 && el.innerText) {
+                                const txt = el.innerText.trim();
+                                if ((txt.includes("so'm") || txt.includes("сум")) && txt.length < 25) {
+                                    const num = parseInt(txt.replace(/[^0-9]/g, ""), 10);
+                                    if (num > 1000 && !foundPrices.includes(num)) {
+                                        foundPrices.push(num);
+                                    }
+                                }
+                            }
+                        }
+                        if (foundPrices.length === 1) {
+                            discountPrice = foundPrices[0];
+                            fullPrice = foundPrices[0];
+                        } else if (foundPrices.length >= 2) {
+                            discountPrice = Math.min(foundPrices[0], foundPrices[1]);
+                            fullPrice = Math.max(foundPrices[0], foundPrices[1]);
+                        }
+
+                        return {
+                            dom_data: {
+                                title: title,
+                                photo_url: photo,
+                                price: discountPrice,
+                                full_price: fullPrice
+                            }
+                        };
+                    }''',
+                    {"pid": p_id, "skuId": url_sku_id}
+                )
+
+                if dom_scraped and dom_scraped.get("ssr_state"):
+                    parsed_ssr = self._parse_uzum_payload(dom_scraped["ssr_state"], p_id)
+                    if parsed_ssr and parsed_ssr.get("variants") and parsed_ssr["variants"][0].get("price", 0) > 0:
+                        return parsed_ssr
+
+                if dom_scraped and dom_scraped.get("dom_data"):
+                    dd = dom_scraped["dom_data"]
+                    if dd.get("title") and not dd["title"].startswith("Uzum Tovar"):
+                        return {
+                            "id": p_id,
+                            "title": dd["title"],
+                            "photo_url": dd.get("photo_url"),
+                            "variants": [{
+                                "sku_id": url_sku_id,
+                                "name": f"Tanlangan variant (#{url_sku_id})" if url_sku_id != p_id else "Asosiy variant",
+                                "price": int(dd.get("price") or 0),
+                                "full_price": int(dd.get("full_price") or dd.get("price") or 0),
+                                "available": 1,
+                            }],
+                        }
+
+                return None
             except Exception as e:
                 print(f"[fetch_product_with_playwright] Xatolik: {e}")
-                return {
-                    "id": p_id,
-                    "title": f"Uzum Mahsuloti #{p_id}",
-                    "photo_url": None,
-                    "variants": [{
-                        "sku_id": url_sku_id,
-                        "name": f"SKU #{url_sku_id}",
-                        "price": 0,
-                        "full_price": 0,
-                        "available": 1,
-                    }],
-                }
+                return None
             finally:
                 await page.close()
 
