@@ -27,6 +27,7 @@ from monitor import PriceMonitor
 
 
 class AddProductFSM(StatesGroup):
+    waiting_for_sku = State()
     waiting_for_price = State()
     waiting_for_mode = State()
 
@@ -51,16 +52,14 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        "🚀 <b>Uzum Market Price Tracker & Auto-Buy Sniper</b> botiga xush kelibsiz!\n\n"
-        "📌 <b>Qo'llanma:</b>\n"
-        "1. Menga Uzum mahsuloti havolasini (<code>https://uzum.uz/...</code>) yuboring.\n"
-        "2. Kutilayotgan maqsadli narxni (<code>target_price</code>) kiriting.\n"
-        "3. Rejimni tanlang:\n"
-        "   • <b>Mode A (Auto-Buy Sniper)</b> — Narx tushishi bilan avtomatik PVZga xarid qiladi.\n"
-        "   • <b>Mode B (1-Click Confirm)</b> — Narx tushganda xabar va <b>[Sotib olish]</b> tugmasini yuboradi.\n\n"
+        "🚀 <b>Uzum Market Price Tracker & Auto-Buy Sniper</b>\n\n"
+        "📌 <b>Qanday ishlaydi:</b>\n"
+        "1. Uzum ilovasi yoki saytidan mahsulot havolasini yuboring.\n"
+        "2. Bot rasm, aksiya narxi va barcha variantlarni (metr, rang, razmer) chiqaradi.\n"
+        "3. Kerakli variantni tanlang va maqsadli narxni belgilang.\n"
+        "4. Narx tushishi bilan bot avtomatik yoki 1-bosishda PVZga buyurtma beradi!\n\n"
         "📋 <b>Buyruqlar:</b>\n"
-        "/list — Kuzatilayotgan tovarlar ro'yxati\n"
-        "/login — Serverda brauzer sessiyasi holatini tekshirish",
+        "/list — Kuzatilayotgan tovarlar",
         parse_mode="HTML",
     )
 
@@ -77,7 +76,7 @@ async def cmd_list(message: Message):
 
     for item in items:
         last_p = f"{item['last_price']:,} so'm" if item["last_price"] else "Hali tekshirilmadi"
-        mode_label = "⚡ Mode A (Auto-Buy)" if item["mode"] == "MODE_A" else "🔔 Mode B (1-Click)"
+        mode_label = "⚡ Auto-Buy (Mode A)" if item["mode"] == "MODE_A" else "🔔 1-Click (Mode B)"
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -92,17 +91,15 @@ async def cmd_list(message: Message):
                 ]
             ]
         )
-        await message.answer(
+        msg_text = (
             f"🆔 <b>#{item['id']} | {item['title']}</b>\n"
             f"🎯 Maqsadli narx: <b>{item['target_price']:,} so'm</b>\n"
             f"💰 Oxirgi narx: <b>{last_p}</b> (Qoldiq: {item['available_amount']} ta)\n"
             f"⚙️ Rejim: <b>{mode_label}</b>\n"
             f"📌 Status: <b>{item['status']}</b>\n"
-            f"🔗 <a href='{item['url']}'>Mahsulot havolasi</a>",
-            reply_markup=kb,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+            f"🔗 <a href='{item['url']}'>Uzum sahifasi</a>"
         )
+        await message.answer(msg_text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message(F.text.contains("uzum.uz"))
@@ -115,21 +112,129 @@ async def handle_uzum_link(message: Message, state: FSMContext):
         await message.answer("⚠️ To'g'ri Uzum.uz mahsulot havolasini yuboring.")
         return
 
-    clean_url = url_match.group(1)
-    await state.update_data(url=clean_url)
-    await state.set_state(AddProductFSM.waiting_for_price)
-    await message.answer(
-        "💰 <b>Maqsadli narxni (target_price) kiriting (so'mda):</b>\n"
-        "Masalan: <code>150000</code>",
-        parse_mode="HTML",
+    full_url = url_match.group(1)
+    status_msg = await message.answer("🔍 Mahsulot ma'lumotlari va rasmlari yuklanmoqda...")
+
+    # Tezkor API orqali tovar ma'lumotlarini olish
+    p_info = await asyncio.to_thread(browser_manager.fetch_product_quick, full_url)
+    await status_msg.delete()
+
+    if not p_info or not p_info.get("variants"):
+        await message.answer("⚠️ Mahsulot ma'lumotlarini yuklab bo'lmadi. Havolani tekshiring.")
+        return
+
+    title = p_info["title"]
+    photo_url = p_info["photo_url"]
+    variants = p_info["variants"]
+
+    # Havola ichida skuId bormi?
+    sku_match = re.search(r"skuId=(\d+)", full_url)
+    target_sku_id = sku_match.group(1) if sku_match else None
+
+    # Agar skuId havola ichida allaqachon bo'lsa, to'g'ridan-to'g'ri o'shani tanlash
+    selected_variant = None
+    if target_sku_id:
+        for v in variants:
+            if v["sku_id"] == target_sku_id:
+                selected_variant = v
+                break
+
+    await state.update_data(
+        url=full_url,
+        title=title,
+        photo_url=photo_url,
+        all_variants=variants
     )
+
+    if selected_variant:
+        # Variant aniq ma'lum
+        await state.update_data(selected_sku=selected_variant)
+        await ask_price_prompt(message, state, selected_variant, title, photo_url)
+    elif len(variants) == 1:
+        # Faqat 1 ta variant bor
+        selected_variant = variants[0]
+        await state.update_data(selected_sku=selected_variant)
+        await ask_price_prompt(message, state, selected_variant, title, photo_url)
+    else:
+        # Bir nechta variantlar bor — Inline tugmalar orqali tanlash
+        await state.set_state(AddProductFSM.waiting_for_sku)
+        kb_rows = []
+        for v in variants[:12]: # Maksimal 12 tagacha tugma
+            v_name = v["name"]
+            v_price = f"{v['price']:,} so'm"
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"🔘 {v_name} — {v_price}",
+                    callback_data=f"pick_sku:{v['sku_id']}"
+                )
+            ])
+        
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        caption = (
+            f"📦 <b>{title}</b>\n\n"
+            f"❗️ <b>Ushbu tovarda bir nechta variantlar mavjud.</b>\n"
+            f"Qaysi birini kuzatmoqchisiz? Quyidagi tugmalardan birini tanlang:"
+        )
+        if photo_url:
+            await message.answer_photo(photo=photo_url, caption=caption, reply_markup=reply_kb, parse_mode="HTML")
+        else:
+            await message.answer(caption, reply_markup=reply_kb, parse_mode="HTML")
+
+
+@dp.callback_query(AddProductFSM.waiting_for_sku, F.data.startswith("pick_sku:"))
+async def handle_sku_picked(call: CallbackQuery, state: FSMContext):
+    sku_id = call.data.split(":")[1]
+    data = await state.get_data()
+    variants = data.get("all_variants", [])
+    title = data.get("title")
+    photo_url = data.get("photo_url")
+
+    selected_variant = next((v for v in variants if v["sku_id"] == sku_id), None)
+    if not selected_variant:
+        await call.answer("Variant topilmadi!", show_alert=True)
+        return
+
+    await state.update_data(selected_sku=selected_variant)
+    await call.message.delete()
+    await ask_price_prompt(call.message, state, selected_variant, title, photo_url)
+    await call.answer()
+
+
+async def ask_price_prompt(message: Message, state: FSMContext, variant: dict, title: str, photo_url: str):
+    await state.set_state(AddProductFSM.waiting_for_price)
+
+    p_price = variant["price"]
+    f_price = variant["full_price"]
+    avail = variant["available"]
+    v_name = variant["name"]
+
+    # Chegirma foizini hisoblash
+    discount_str = ""
+    if f_price > p_price:
+        pct = int(round((1 - p_price / f_price) * 100))
+        discount_str = f" <i>(-{pct}%)</i>"
+
+    caption = (
+        f"📦 <b>{title}</b>\n"
+        f"🏷 <b>Tanlangan variant:</b> <code>{v_name}</code>\n\n"
+        f"💵 Asl narxi: <s>{f_price:,} so'm</s>\n"
+        f"🔥 <b>Hozirgi aksiya narxi:</b> <b>{p_price:,} so'm</b>{discount_str}\n"
+        f"📊 Ombordagi qoldiq: <b>{avail} ta</b>\n\n"
+        f"💰 <b>Ushbu tovar qancha narxga tushsa avtomatik xarid qilinsin?</b>\n"
+        f"<i>Maqsadli narxni faqat raqamlarda kiriting (masalan: <code>{int(p_price * 0.9)}</code>):</i>"
+    )
+
+    if photo_url:
+        await message.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML")
+    else:
+        await message.answer(caption, parse_mode="HTML")
 
 
 @dp.message(AddProductFSM.waiting_for_price)
 async def handle_target_price(message: Message, state: FSMContext):
     digits = re.sub(r"[^\d]", "", message.text or "")
     if not digits or int(digits) <= 0:
-        await message.answer("⚠️ Iltimos, narxni faqat raqamlarda kiriting (masalan: <code>125000</code>):", parse_mode="HTML")
+        await message.answer("⚠️ Iltimos, narxni faqat raqamlarda kiriting (masalan: <code>65000</code>):", parse_mode="HTML")
         return
 
     target_price = int(digits)
@@ -153,8 +258,8 @@ async def handle_target_price(message: Message, state: FSMContext):
         ]
     )
     await message.answer(
-        f"🎯 Maqsadli narx: <b>{target_price:,} so'm</b>\n\n"
-        f"Endi xarid rejimini tanlang:",
+        f"🎯 Maqsadli narx: <b>{target_price:,} so'm</b> qilib belgilandi.\n\n"
+        f"Endi buyurtma rejimini tanlang:",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -165,11 +270,19 @@ async def handle_mode_selection(call: CallbackQuery, state: FSMContext):
     mode = call.data.split(":")[1]
     data = await state.get_data()
     url = data["url"]
+    title = data["title"]
+    photo_url = data.get("photo_url")
     target_price = data["target_price"]
+    sku = data.get("selected_sku", {})
+    sku_id = sku.get("sku_id")
+    variant_name = sku.get("name", "")
 
     product_id = await add_product(
         user_id=call.from_user.id,
         url=url,
+        sku_id=sku_id,
+        title=f"{title} ({variant_name})" if variant_name else title,
+        photo_url=photo_url,
         target_price=target_price,
         mode=mode,
     )
@@ -183,10 +296,11 @@ async def handle_mode_selection(call: CallbackQuery, state: FSMContext):
 
     await call.message.edit_text(
         f"✅ <b>Tovar kuzatuvga qo'shildi! (ID: #{product_id})</b>\n\n"
-        f"🔗 Havola: {url}\n"
+        f"📦 Tovar: <b>{title}</b>\n"
+        f"🏷 Variant: <code>{variant_name}</code>\n"
         f"🎯 Maqsadli narx: <b>{target_price:,} so'm</b>\n"
         f"⚙️ Rejim: {mode_desc}\n"
-        f"⏱ Tekshirish intervali: <b>45–90 soniya (Anti-Ban)</b>",
+        f"⏱ Kuzatish oralig'i: <b>45–90 soniya (Anti-Ban)</b>",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -215,11 +329,16 @@ async def handle_one_click_buy(call: CallbackQuery):
     await call.message.edit_text(
         f"⚡ <b>1-Click Auto-Checkout bajarilmoqda...</b>\n"
         f"📦 Tovar: <b>{product['title']}</b>\n"
-        f"Iltimos, 10-15 soniya kuting, yakuniy skrinshot yuboriladi.",
+        f"Iltimos, kuting, buyurtma tasdiqlanib skrinshot yuboriladi...",
         parse_mode="HTML",
     )
 
-    result = await browser_manager.auto_checkout(product["url"], product_id)
+    checkout_url = product["url"]
+    if product.get("sku_id") and "skuId=" not in checkout_url:
+        sep = "&" if "?" in checkout_url else "?"
+        checkout_url = f"{checkout_url}{sep}skuId={product['sku_id']}"
+
+    result = await browser_manager.auto_checkout(checkout_url, product_id)
     if result["success"]:
         await mark_status(product_id, "COMPLETED")
         caption = (

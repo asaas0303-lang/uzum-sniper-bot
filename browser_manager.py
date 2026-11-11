@@ -2,12 +2,77 @@ import asyncio
 import json
 import re
 import time
+import urllib.request
 from pathlib import Path
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
 from config import SESSION_DIR, SCREENSHOTS_DIR, HEADLESS
 
 
 class UzumBrowserManager:
+    @staticmethod
+    def fetch_product_quick(product_id_or_url: str) -> dict | None:
+        import urllib.request
+        import json
+        import re
+
+        m = re.search(r"product/.*?(\d+)", str(product_id_or_url))
+        if not m:
+            m = re.search(r"product/(\d+)", str(product_id_or_url))
+        p_id = m.group(1) if m else str(product_id_or_url)
+
+        api_url = f"https://api.uzum.uz/api/v2/product/{p_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "uz-UZ,uz;q=0.9,ru;q=0.8"
+        }
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode("utf-8"))
+                    payload = data.get("payload", {}).get("data", data)
+                    
+                    # Bosh rasm
+                    photos = payload.get("photos", [])
+                    photo_url = None
+                    if photos:
+                        p_obj = photos[0].get("photo", {})
+                        photo_url = p_obj.get("high") or p_obj.get("low")
+
+                    title = payload.get("title", "Uzum Mahsuloti")
+                    sku_list = payload.get("skuList", [])
+                    
+                    variants = []
+                    for s in sku_list:
+                        s_id = str(s.get("id"))
+                        p_price = int(s.get("purchasePrice") or 0)
+                        f_price = int(s.get("fullPrice") or p_price)
+                        avail = int(s.get("availableAmount") or 0)
+                        
+                        # Variant tavsifi (metr, rang, razmer)
+                        chars = s.get("characteristics", [])
+                        char_desc = " / ".join([c.get("valueTitle", "") for c in chars if c.get("valueTitle")])
+                        if not char_desc:
+                            char_desc = f"Variant #{s_id[-4:]}"
+
+                        variants.append({
+                            "sku_id": s_id,
+                            "name": char_desc,
+                            "price": p_price,
+                            "full_price": f_price,
+                            "available": avail
+                        })
+
+                    return {
+                        "id": p_id,
+                        "title": title,
+                        "photo_url": photo_url,
+                        "variants": variants
+                    }
+        except Exception as e:
+            print(f"[fetch_product_quick] API xatosi: {e}")
+        return None
+
     def __init__(self):
         self.playwright = None
         self.context: BrowserContext | None = None

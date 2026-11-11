@@ -9,7 +9,9 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 url TEXT NOT NULL,
+                sku_id TEXT DEFAULT NULL,
                 title TEXT DEFAULT 'Uzum Mahsuloti',
+                photo_url TEXT DEFAULT NULL,
                 target_price INTEGER NOT NULL,
                 last_price INTEGER DEFAULT NULL,
                 available_amount INTEGER DEFAULT 0,
@@ -19,17 +21,26 @@ async def init_db():
                 completed_at TIMESTAMP DEFAULT NULL
             )
         ''')
+        # Agar eski bazada sku_id ustuni bo'lmasa, qo'shish
+        try:
+            await db.execute("ALTER TABLE products ADD COLUMN sku_id TEXT DEFAULT NULL")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE products ADD COLUMN photo_url TEXT DEFAULT NULL")
+        except Exception:
+            pass
         await db.commit()
 
 
-async def add_product(user_id: int, url: str, target_price: int, mode: str) -> int:
+async def add_product(user_id: int, url: str, target_price: int, mode: str, sku_id: str = None, title: str = "Uzum Mahsuloti", photo_url: str = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             '''
-            INSERT INTO products (user_id, url, target_price, mode, status)
-            VALUES (?, ?, ?, ?, 'ACTIVE')
+            INSERT INTO products (user_id, url, sku_id, title, photo_url, target_price, mode, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
             ''',
-            (user_id, url, target_price, mode)
+            (user_id, url, sku_id, title, photo_url, target_price, mode)
         )
         await db.commit()
         return cursor.lastrowid
@@ -81,10 +92,6 @@ async def update_product_metrics(product_id: int, title: str, last_price: int, a
 
 
 async def acquire_safety_lock(product_id: int) -> bool:
-    '''
-    Safety Lock: Bitta tovarni 2 marta sotib olmaslik uchun atomar blokirovka.
-    Faqat ACTIVE yoki NOTIFIED holatdagi tovarni PROCESSING holatiga o'tkazadi.
-    '''
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             '''
