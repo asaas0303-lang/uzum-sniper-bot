@@ -372,6 +372,10 @@ async def handle_delete_product(call: CallbackQuery):
 
 async def main():
     await init_db()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     asyncio.create_task(monitor.start_loop())
     print("[Bot] Telegram bot ishga tushdi...")
     try:
