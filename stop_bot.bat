@@ -5,3 +5,4 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $
 echo.
 echo Bot muvaffaqiyatli to'xtatildi.
 timeout /t 3 >nul
+

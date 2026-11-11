@@ -115,9 +115,12 @@ async def handle_uzum_link(message: Message, state: FSMContext):
     full_url = url_match.group(1)
     status_msg = await message.answer("🔍 Mahsulot ma'lumotlari va rasmlari yuklanmoqda...")
 
-    # Tezkor API orqali tovar ma'lumotlarini olish
-    p_info = await asyncio.to_thread(browser_manager.fetch_product_quick, full_url)
-    await status_msg.delete()
+    # Playwright + API orqali tovar ma'lumotlarini olish
+    p_info = await browser_manager.fetch_product_with_playwright(full_url)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     if not p_info or not p_info.get("variants"):
         await message.answer("⚠️ Mahsulot ma'lumotlarini yuklab bo'lmadi. Havolani tekshiring.")
@@ -176,9 +179,12 @@ async def handle_uzum_link(message: Message, state: FSMContext):
             f"Qaysi birini kuzatmoqchisiz? Quyidagi tugmalardan birini tanlang:"
         )
         if photo_url:
-            await message.answer_photo(photo=photo_url, caption=caption, reply_markup=reply_kb, parse_mode="HTML")
-        else:
-            await message.answer(caption, reply_markup=reply_kb, parse_mode="HTML")
+            try:
+                await message.answer_photo(photo=photo_url, caption=caption, reply_markup=reply_kb, parse_mode="HTML")
+                return
+            except Exception:
+                pass
+        await message.answer(caption, reply_markup=reply_kb, parse_mode="HTML")
 
 
 @dp.callback_query(AddProductFSM.waiting_for_sku, F.data.startswith("pick_sku:"))
@@ -209,25 +215,36 @@ async def ask_price_prompt(message: Message, state: FSMContext, variant: dict, t
     v_name = variant["name"]
 
     # Chegirma foizini hisoblash
-    discount_str = ""
-    if f_price > p_price:
-        pct = int(round((1 - p_price / f_price) * 100))
-        discount_str = f" <i>(-{pct}%)</i>"
+    if p_price > 0:
+        discount_str = ""
+        if f_price > p_price:
+            pct = int(round((1 - p_price / f_price) * 100))
+            discount_str = f" <i>(-{pct}%)</i>"
+        price_lines = (
+            f"💵 Asl narxi: <s>{f_price:,} so'm</s>\n"
+            f"🔥 <b>Hozirgi aksiya narxi:</b> <b>{p_price:,} so'm</b>{discount_str}\n"
+        )
+        example_price = int(p_price * 0.9) if int(p_price * 0.9) > 0 else 50000
+    else:
+        price_lines = "🔥 <b>Hozirgi narxi:</b> <i>Kuzatuvda aniqlanadi</i>\n"
+        example_price = 50000
 
     caption = (
         f"📦 <b>{title}</b>\n"
         f"🏷 <b>Tanlangan variant:</b> <code>{v_name}</code>\n\n"
-        f"💵 Asl narxi: <s>{f_price:,} so'm</s>\n"
-        f"🔥 <b>Hozirgi aksiya narxi:</b> <b>{p_price:,} so'm</b>{discount_str}\n"
+        f"{price_lines}"
         f"📊 Ombordagi qoldiq: <b>{avail} ta</b>\n\n"
         f"💰 <b>Ushbu tovar qancha narxga tushsa avtomatik xarid qilinsin?</b>\n"
-        f"<i>Maqsadli narxni faqat raqamlarda kiriting (masalan: <code>{int(p_price * 0.9)}</code>):</i>"
+        f"<i>Maqsadli narxni faqat raqamlarda kiriting (masalan: <code>{example_price}</code>):</i>"
     )
 
     if photo_url:
-        await message.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML")
-    else:
-        await message.answer(caption, parse_mode="HTML")
+        try:
+            await message.answer_photo(photo=photo_url, caption=caption, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    await message.answer(caption, parse_mode="HTML")
 
 
 @dp.message(AddProductFSM.waiting_for_price)
