@@ -21,7 +21,6 @@ async def init_db():
                 completed_at TIMESTAMP DEFAULT NULL
             )
         ''')
-        # Agar eski bazada sku_id ustuni bo'lmasa, qo'shish
         try:
             await db.execute("ALTER TABLE products ADD COLUMN sku_id TEXT DEFAULT NULL")
         except Exception:
@@ -33,14 +32,22 @@ async def init_db():
         await db.commit()
 
 
-async def add_product(user_id: int, url: str, target_price: int, mode: str, sku_id: str = None, title: str = "Uzum Mahsuloti", photo_url: str = None) -> int:
+async def add_product(
+    user_id: int,
+    url: str,
+    target_price: int,
+    mode: str,
+    sku_id: str = None,
+    title: str = "Uzum Mahsuloti",
+    photo_url: str = None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             '''
             INSERT INTO products (user_id, url, sku_id, title, photo_url, target_price, mode, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
             ''',
-            (user_id, url, sku_id, title, photo_url, target_price, mode)
+            (user_id, url, sku_id, title, photo_url, target_price, mode),
         )
         await db.commit()
         return cursor.lastrowid
@@ -61,7 +68,7 @@ async def get_user_products(user_id: int) -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM products WHERE user_id = ? ORDER BY id DESC LIMIT 20",
-            (user_id,)
+            (user_id,),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -72,7 +79,7 @@ async def get_product_by_id(product_id: int) -> dict | None:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM products WHERE id = ?",
-            (product_id,)
+            (product_id,),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -86,7 +93,7 @@ async def update_product_metrics(product_id: int, title: str, last_price: int, a
             SET title = ?, last_price = ?, available_amount = ?
             WHERE id = ?
             ''',
-            (title, last_price, available_amount, product_id)
+            (title, last_price, available_amount, product_id),
         )
         await db.commit()
 
@@ -99,7 +106,7 @@ async def acquire_safety_lock(product_id: int) -> bool:
             SET status = 'PROCESSING'
             WHERE id = ? AND status IN ('ACTIVE', 'NOTIFIED')
             ''',
-            (product_id,)
+            (product_id,),
         )
         await db.commit()
         return cursor.rowcount > 0
@@ -107,19 +114,19 @@ async def acquire_safety_lock(product_id: int) -> bool:
 
 async def mark_status(product_id: int, status: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        if status == 'COMPLETED':
+        if status == "COMPLETED":
             await db.execute(
                 '''
                 UPDATE products
                 SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 ''',
-                (product_id,)
+                (product_id,),
             )
         else:
             await db.execute(
                 "UPDATE products SET status = ? WHERE id = ?",
-                (status, product_id)
+                (status, product_id),
             )
         await db.commit()
 
@@ -128,7 +135,7 @@ async def delete_product(product_id: int, user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "DELETE FROM products WHERE id = ? AND user_id = ?",
-            (product_id, user_id)
+            (product_id, user_id),
         )
         await db.commit()
         return cursor.rowcount > 0

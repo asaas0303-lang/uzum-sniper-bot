@@ -1,14 +1,45 @@
 import asyncio
+import gzip
 import json
 import re
+import ssl
 import time
 import urllib.request
-from pathlib import Path
+import uuid
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
 from config import SESSION_DIR, SCREENSHOTS_DIR, HEADLESS
 
 
 class UzumBrowserManager:
+    def __init__(self):
+        self.playwright = None
+        self.context: BrowserContext | None = None
+        self._lock = asyncio.Lock()
+
+    async def start(self, headless: bool = HEADLESS):
+        if self.context is not None:
+            return
+        self.playwright = await async_playwright().start()
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=str(SESSION_DIR),
+            headless=headless,
+            viewport={"width": 1366, "height": 820},
+            locale="uz-UZ",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+    async def stop(self):
+        if self.context:
+            await self.context.close()
+            self.context = None
+        if self.playwright:
+            await self.playwright.stop()
+            self.playwright = None
+
     @staticmethod
     def _parse_uzum_payload(data: dict, fallback_id: str = "") -> dict | None:
         payload = data.get("payload", {})
@@ -21,7 +52,6 @@ class UzumBrowserManager:
         if not title or not isinstance(sku_list, list) or not sku_list:
             return None
 
-        # 1. Bosh rasmni har qanday chuqurlikdan (800/720/540/high/low) topish
         photo_url = None
         photos = product_obj.get("photos", [])
         if isinstance(photos, list) and photos:
@@ -43,7 +73,6 @@ class UzumBrowserManager:
                                     photo_url = v.get("high") or v.get("low")
                                     break
 
-        # 2. Xarakteristikalar (Rang, Razmer, Metr) xaritasini tuzish
         char_groups = product_obj.get("characteristics", [])
         variants = []
 
@@ -59,7 +88,6 @@ class UzumBrowserManager:
                 for sc in sku_chars:
                     if not isinstance(sc, dict):
                         continue
-                    # Format A: charId va valueIndex indekslari orqali
                     c_idx = sc.get("charId")
                     v_idx = sc.get("valueIndex")
                     if c_idx is not None and v_idx is not None and isinstance(char_groups, list):
@@ -71,7 +99,6 @@ class UzumBrowserManager:
                                 v_title = vals[int(v_idx)].get("title", "")
                                 if v_title:
                                     char_parts.append(f"{g_title}: {v_title}" if g_title else v_title)
-                    # Format B: to'g'ridan-to'g'ri valueTitle bo'lsa
                     elif sc.get("valueTitle") or sc.get("title"):
                         char_parts.append(str(sc.get("valueTitle") or sc.get("title")))
 
@@ -94,13 +121,6 @@ class UzumBrowserManager:
 
     @classmethod
     def fetch_product_quick(cls, product_id_or_url: str) -> dict | None:
-        import urllib.request
-        import ssl
-        import gzip
-        import uuid
-        import json
-        import re
-
         raw_url = str(product_id_or_url).strip()
         base_path = raw_url.split("?")[0].rstrip("/")
         m = re.search(r"(\d+)$", base_path)
@@ -139,7 +159,6 @@ class UzumBrowserManager:
             except Exception as e:
                 print(f"[fetch_product_quick] API urinish xatosi ({api_url}): {e}")
 
-        # 2-QATLAM: HTML sahifadan OpenGraph (og:title, og:image) o'qish
         try:
             page_req = urllib.request.Request(raw_url, headers=headers)
             with urllib.request.urlopen(page_req, timeout=10, context=ctx) as resp:
@@ -177,12 +196,10 @@ class UzumBrowserManager:
         return None
 
     async def fetch_product_with_playwright(self, product_url: str) -> dict | None:
-        # 1. Avval tezkor API ni sinab ko'ramiz
         quick = await asyncio.to_thread(self.fetch_product_quick, product_url)
         if quick and quick.get("variants") and quick["variants"][0].get("price", 0) > 0:
             return quick
 
-        # 2. Agar API bloklansa, Playwright brauzeri orqali JSON va DOM dan olamiz
         async with self._lock:
             await self.start(headless=HEADLESS)
             page = await self.context.new_page()
@@ -220,7 +237,6 @@ class UzumBrowserManager:
                 if captured_parsed:
                     return captured_parsed
 
-                # 3. Yakuniy DOM Fallback (hech qachon xatolik bermasligi uchun)
                 dom_info = await self._fallback_dom_extract(page)
                 og_img = None
                 try:
@@ -247,7 +263,6 @@ class UzumBrowserManager:
                 }
             except Exception as e:
                 print(f"[fetch_product_with_playwright] Xatolik: {e}")
-                # Eng oxirgi zaxira: havolani baribir qabul qilish
                 return {
                     "id": p_id,
                     "title": f"Uzum Mahsuloti #{p_id}",
@@ -263,94 +278,55 @@ class UzumBrowserManager:
             finally:
                 await page.close()
 
-    def __init__(self):
-        self.playwright = None
-        self.context: BrowserContext | None = None
-        self._lock = asyncio.Lock()
-
-    async def start(self, headless: bool = HEADLESS):
-        if self.context is not None:
-            return
-        self.playwright = await async_playwright().start()
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(SESSION_DIR),
-            headless=headless,
-            viewport={"width": 1366, "height": 820},
-            locale="uz-UZ",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-    async def stop(self):
-        if self.context:
-            await self.context.close()
-            self.context = None
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
-
     def _extract_sku_from_json(self, data: dict, target_sku_id: str | None = None) -> dict | None:
-        '''
-        Uzum API v2 yoki GraphQL JSON javobidan title, purchasePrice va availableAmount ni ajratib oladi.
-        '''
-        payload = data.get("payload", {})
-        product_obj = payload.get("data", data.get("data", data))
-        if not isinstance(product_obj, dict):
+        parsed = self._parse_uzum_payload(data)
+        if not parsed or not parsed.get("variants"):
             return None
-
-        sku_list = product_obj.get("skuList")
-        if not isinstance(sku_list, list) or not sku_list:
-            return None
-
-        title = product_obj.get("title", "Uzum Mahsuloti")
-        chosen_sku = None
-
+        variants = parsed["variants"]
+        chosen = None
         if target_sku_id:
-            for sku in sku_list:
-                if str(sku.get("id")) == str(target_sku_id):
-                    chosen_sku = sku
+            for v in variants:
+                if str(v["sku_id"]) == str(target_sku_id):
+                    chosen = v
                     break
+        if not chosen:
+            in_stock = [v for v in variants if v["available"] > 0]
+            chosen = min(in_stock, key=lambda x: x["price"]) if in_stock else variants[0]
 
-        if not chosen_sku:
-            # Omborda qoldig'i bor eng arzon SKU ni tanlash
-            in_stock_skus = [s for s in sku_list if int(s.get("availableAmount", 0)) > 0]
-            if in_stock_skus:
-                chosen_sku = min(
-                    in_stock_skus,
-                    key=lambda s: int(s.get("purchasePrice") or s.get("fullPrice") or 999999999)
-                )
-            else:
-                chosen_sku = sku_list[0]
-
-        price = int(chosen_sku.get("purchasePrice") or chosen_sku.get("fullPrice") or 0)
-        available = int(chosen_sku.get("availableAmount") or 0)
-
-        if price <= 0:
+        if chosen["price"] <= 0:
             return None
-
         return {
-            "title": title,
-            "price": price,
-            "available_amount": available,
-            "sku_id": chosen_sku.get("id"),
+            "title": parsed["title"],
+            "price": chosen["price"],
+            "available_amount": chosen["available"],
+            "sku_id": chosen["sku_id"],
         }
 
     async def check_price_and_stock(self, product_url: str) -> dict | None:
-        '''
-        Sahifani ochib page.on("response") orqali Uzum ichki JSON API javobidan
-        aniq narx va ombordagi qoldiqni (availableAmount) o'qiydi.
-        '''
+        sku_match = re.search(r"skuId=(\d+)", product_url)
+        target_sku_id = sku_match.group(1) if sku_match else None
+
+        quick = await asyncio.to_thread(self.fetch_product_quick, product_url)
+        if quick and quick.get("variants"):
+            variants = quick["variants"]
+            chosen = None
+            if target_sku_id:
+                chosen = next((v for v in variants if str(v["sku_id"]) == str(target_sku_id)), None)
+            if not chosen:
+                in_stock = [v for v in variants if v["available"] > 0]
+                chosen = min(in_stock, key=lambda x: x["price"]) if in_stock else variants[0]
+            if chosen and chosen["price"] > 0:
+                return {
+                    "title": quick["title"],
+                    "price": chosen["price"],
+                    "available_amount": chosen["available"],
+                    "sku_id": chosen["sku_id"],
+                }
+
         async with self._lock:
             await self.start(headless=HEADLESS)
             page = await self.context.new_page()
             captured_result = None
-
-            # URL ichida ?skuId= bo'lsa ajratib olamiz
-            sku_match = re.search(r"skuId=(\d+)", product_url)
-            target_sku_id = sku_match.group(1) if sku_match else None
 
             async def on_response(response: Response):
                 nonlocal captured_result
@@ -370,16 +346,13 @@ class UzumBrowserManager:
                         pass
 
             page.on("response", on_response)
-
             try:
                 await page.goto(product_url, wait_until="domcontentloaded", timeout=45000)
-                # JSON API javobi kelishini maksimal 8 soniya kutamiz
                 for _ in range(16):
                     if captured_result is not None:
                         break
                     await asyncio.sleep(0.5)
 
-                # Fallback: Agar kesh tufayli XHR tutib bo'lmasa, DOM/window state dan o'qiymiz
                 if captured_result is None:
                     captured_result = await self._fallback_dom_extract(page)
 
@@ -410,7 +383,6 @@ class UzumBrowserManager:
                         price_val = int(digits)
                         break
 
-            # Savatga qo'shish tugmasi faol bo'lsa qoldiq > 0 deb olamiz
             add_btn = page.locator(
                 "button[data-test-id='button__add-cart'], "
                 "button:has-text('Savatga'), "
@@ -430,13 +402,6 @@ class UzumBrowserManager:
         return None
 
     async def auto_checkout(self, product_url: str, product_id: int) -> dict:
-        '''
-        Mode A va Mode B uchun Auto-Checkout:
-        1. Mahsulot sahifasini ochadi va savatga qo'shadi.
-        2. Savat va Rasmiylashtirish (Checkout) sahifasiga o'tadi.
-        3. PVZ (Topshirish punkti) va 'Topshirish punktida to'lash' (Оплата при получении) usulini tanlaydi.
-        4. Buyurtmani tasdiqlaydi va yakuniy skrinshotni saqlaydi.
-        '''
         async with self._lock:
             await self.start(headless=HEADLESS)
             page = await self.context.new_page()
@@ -446,7 +411,6 @@ class UzumBrowserManager:
                 await page.goto(product_url, wait_until="networkidle", timeout=60000)
                 await asyncio.sleep(1.5)
 
-                # 1. Savatga qo'shish tugmasini bosish
                 add_to_cart_selectors = [
                     "button[data-test-id='button__add-cart']",
                     "button[data-test-id='button__add-to-cart']",
@@ -463,7 +427,6 @@ class UzumBrowserManager:
                         break
 
                 if not added:
-                    # Agar allaqachon savatda bo'lsa ("Savatda" / "O'tish" tugmasi chiqib tursa)
                     in_cart_loc = page.locator("a[href*='/cart'], button:has-text('Savatga oʻtish'), button:has-text('Перейти в корзину')").first
                     if await in_cart_loc.count() == 0:
                         await page.screenshot(path=str(screenshot_path), full_page=True)
@@ -474,8 +437,6 @@ class UzumBrowserManager:
                         }
 
                 await asyncio.sleep(1.5)
-
-                # 2. Savatga o'tish va Rasmiylashtirish (Checkout) bosqichi
                 await page.goto("https://uzum.uz/uz/cart", wait_until="networkidle", timeout=45000)
                 await asyncio.sleep(2.0)
 
@@ -495,7 +456,6 @@ class UzumBrowserManager:
 
                 await asyncio.sleep(3.0)
 
-                # 3. "Topshirish punktida to'lash" (Оплата при получении) usulini tanlash
                 pay_on_delivery_selectors = [
                     "[data-test-id*='payment-upon-receipt']",
                     "[data-test-id*='cash']",
@@ -515,7 +475,6 @@ class UzumBrowserManager:
                         except Exception:
                             continue
 
-                # 4. Yakuniy "Buyurtma berish" / "To'lov qilish" tugmasini bosish
                 place_order_selectors = [
                     "button[data-test-id='button__make-order']",
                     "button[data-test-id='checkout__submit']",
@@ -538,7 +497,7 @@ class UzumBrowserManager:
                 if not order_clicked:
                     return {
                         "success": False,
-                        "error": "Checkout sahifasida yakuniy tasdiqlash tugmasi bosilmadi (PVZ yoki Login holatini skrinshotdan tekshiring).",
+                        "error": "Checkout sahifasida yakuniy tasdiqlash tugmasi bosilmadi.",
                         "screenshot": str(screenshot_path),
                     }
 
@@ -563,10 +522,6 @@ class UzumBrowserManager:
 
 
 async def interactive_login():
-    '''
-    Birinchi marta ishga tushirganda (python browser_manager.py --login)
-    foydalanuvchi Uzum profiliga kirishi va PVZ tanlashi uchun oyna ochadi.
-    '''
     print("=" * 65)
     print("[UZUM SESSION SETUP] Brauzer ochilmoqda (headless=False)...")
     print("1. Telefon raqamingiz va SMS kod orqali Uzum profilingizga kiring.")
