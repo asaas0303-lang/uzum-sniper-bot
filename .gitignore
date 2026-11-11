@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+uzum_session/
+screenshots/
+*.db
+uzum_sniper_bot.zip
