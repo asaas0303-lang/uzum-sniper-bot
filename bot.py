@@ -110,7 +110,7 @@ async def handle_uzum_link(message: Message, state: FSMContext):
     if not is_authorized(message.from_user.id):
         return
 
-    url_match = re.search(r"(https?://[^\s]+uzum\.uz[^\s]*)", message.text)
+    url_match = re.search(r"(https?://[^\s]*uzum\.uz/[^\s]+)", message.text)
     if not url_match:
         await message.answer("⚠️ To'g'ri Uzum.uz mahsulot havolasini yuboring.")
         return
