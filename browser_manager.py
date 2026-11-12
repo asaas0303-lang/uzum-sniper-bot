@@ -18,7 +18,12 @@ class UzumBrowserManager:
 
     async def start(self, headless: bool = HEADLESS):
         if self.context is not None:
-            return
+            try:
+                _ = self.context.pages
+                return
+            except Exception:
+                await self.stop()
+
         self.playwright = await async_playwright().start()
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(SESSION_DIR),
@@ -33,12 +38,28 @@ class UzumBrowserManager:
         )
 
     async def stop(self):
-        if self.context:
-            await self.context.close()
-            self.context = None
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        self.context = None
+
+        try:
+            if self.playwright:
+                await self.playwright.stop()
+        except Exception:
+            pass
+        self.playwright = None
+
+    async def get_safe_page(self) -> Page:
+        await self.start(headless=HEADLESS)
+        try:
+            return await self.context.new_page()
+        except Exception:
+            await self.stop()
+            await self.start(headless=HEADLESS)
+            return await self.context.new_page()
 
     @classmethod
     def _find_product_dict(cls, obj):
@@ -278,8 +299,7 @@ class UzumBrowserManager:
 
         # 2. Playwright orqali sahifani ochish va ichki API + DOM dan o'qish
         async with self._lock:
-            await self.start(headless=HEADLESS)
-            page = await self.context.new_page()
+            page = await self.get_safe_page()
             captured_parsed = None
 
             async def on_resp(response: Response):
@@ -482,8 +502,7 @@ class UzumBrowserManager:
                 }
 
         async with self._lock:
-            await self.start(headless=HEADLESS)
-            page = await self.context.new_page()
+            page = await self.get_safe_page()
             captured_result = None
 
             async def on_response(response: Response):
@@ -561,8 +580,7 @@ class UzumBrowserManager:
 
     async def auto_checkout(self, product_url: str, product_id: int) -> dict:
         async with self._lock:
-            await self.start(headless=HEADLESS)
-            page = await self.context.new_page()
+            page = await self.get_safe_page()
             screenshot_path = SCREENSHOTS_DIR / f"order_{product_id}_{int(time.time())}.png"
 
             try:
